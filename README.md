@@ -38,24 +38,23 @@ on:
 
 jobs:
   cleanup:
+    permissions:
+      contents: read
+      id-token: write   # assume the ECR role via OIDC
+      actions: write    # cancel in-progress build runs
     uses: miriel-ai/autodev-workflows/.github/workflows/cleanup-ecr-tags.yml@v1
     with:
       images_json: '[{"image":"<org>/<ecr-repo>","target_segment":"dev"}]'
       build_workflow_name: build-and-push-to-ecr.yml
+      role_to_assume: ${{ vars.AUTODEV_ECR_ROLE_ARN }}
       # build_server_id: build-server-1   # default; must match the build tag prefix
       # aws_region: us-east-2             # default
-    secrets:
-      cicd_access_key_id: ${{ secrets.CICD_ACCESS_KEY_ID }}
-      cicd_secret_key: ${{ secrets.CICD_SECRET_KEY }}
 ```
 
-The workflow holds **no secrets of its own** — the AWS credentials are passed in
-by the caller:
-
-| Secret | What it is |
-| --- | --- |
-| `cicd_access_key_id` | AWS access key id for the caller's ECR CICD principal |
-| `cicd_secret_key`    | AWS secret access key for that principal |
+**Authentication is GitHub OIDC only** — there is no static-key fallback. The
+caller passes `role_to_assume` (the ARN of an IAM role whose trust policy lets
+this repo's OIDC token mint ECR credentials) and grants the calling job
+`id-token: write`. The workflow holds no secrets of its own.
 
 For a daily orphan sweep, add a second `schedule`-triggered job that passes
 `mode: audit` (and, once a few dry runs look sane, `dry_run: false`). See the

@@ -59,6 +59,13 @@ on:
         required: false
         type: string
         default: "us-east-2"
+      role_to_assume:
+        description: |
+          ARN of the IAM role to assume via GitHub OIDC for ECR access. The
+          calling job must grant `id-token: write`. Authentication is OIDC-only;
+          there is no static-key fallback.
+        required: true
+        type: string
       include_legacy_tag_pattern:
         description: |
           Also match the pre-BUILD_SERVER_ID legacy tag shape
@@ -95,15 +102,10 @@ on:
         required: false
         type: number
         default: 24
-    secrets:
-      cicd_access_key_id:
-        required: true
-      cicd_secret_key:
-        required: true
-
 permissions:
   contents: read
-  actions: write  # cancel-builds needs to cancel sibling workflow runs
+  id-token: write  # OIDC: assume the caller's ECR role
+  actions: write   # cancel-builds needs to cancel sibling workflow runs
 
 jobs:
   cancel-builds:
@@ -197,8 +199,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.cicd_access_key_id }}
-          aws-secret-access-key: ${{ secrets.cicd_secret_key }}
+          role-to-assume: ${{ inputs.role_to_assume }}
           aws-region: ${{ inputs.aws_region }}
 
       - name: Determine branch name
@@ -304,8 +305,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.cicd_access_key_id }}
-          aws-secret-access-key: ${{ secrets.cicd_secret_key }}
+          role-to-assume: ${{ inputs.role_to_assume }}
           aws-region: ${{ inputs.aws_region }}
 
       - name: Find and (optionally) delete orphan branch tags
