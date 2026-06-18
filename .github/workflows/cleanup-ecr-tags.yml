@@ -1,0 +1,432 @@
+# Reusable workflow: clean up ECR tags + cancel running builds when a branch
+# stops being deployable (PR closed / branch deleted).
+#
+# Public, cross-org-callable copy of the autodev cleanup workflow. Reference it
+# from a calling repo's own .github/workflows/cleanup-ecr-tags.yml as:
+#   uses: miriel-ai/autodev-workflows/.github/workflows/cleanup-ecr-tags.yml@v1
+#
+# Two modes:
+#   * mode=reactive (default): triggered by the caller on `pull_request: closed`
+#     / `delete`. Cancels in-progress builds for the closing branch and
+#     batch-deletes its ECR tags.
+#   * mode=audit: triggered by the caller on a `schedule`. Lists ECR tags for
+#     each matrix entry, diffs against the calling repo's live branch list,
+#     and (optionally) deletes the orphans. Catches the cases the reactive
+#     path drops on the floor — dropped webhooks, force-pushes, partial
+#     cleanups, runs that errored mid-batch, branches deleted via API without
+#     firing the events we listen for.
+#
+# Without this, the deploy-controller's "tag deleted from ECR → tear down the
+# stack" path only fires once its next poll sees no matching tags, so the last
+# per-branch preview stack lingers until it is torn down by hand.
+#
+# Tag scheme this matches (must agree with the build workflow):
+#   {build_server_id}-{target_segment}-{sanitized-branch}-{short-sha}
+#
+# Each entry in `images_json` is one (ECR repo × target_segment) pair to
+# scan — same shape the calling repo's build matrix runs across.
+name: Cleanup ECR Branch Tags (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      images_json:
+        description: |
+          JSON array of `{image, target_segment}` objects, one per ECR-repo ×
+          tag-segment combination the calling repo builds. Each entry produces
+          one cleanup job. Example:
+            '[{"image":"my-org/services","target_segment":"api-dev"},
+              {"image":"my-org/services","target_segment":"services-dev"},
+              {"image":"my-org/dashboard","target_segment":"dev"},
+              {"image":"my-org/dashboard","target_segment":"prod"}]'
+        required: true
+        type: string
+      build_workflow_name:
+        description: |
+          Filename of the build workflow whose in-progress runs should be
+          cancelled for the closing branch (e.g. `build-and-push-to-ecr.yml`).
+          Filename only, no path.
+        required: true
+        type: string
+      build_server_id:
+        description: |
+          The `BUILD_SERVER_ID` segment the calling repo prepends to its tags.
+          Must agree with the controller's filter prefix.
+        required: false
+        type: string
+        default: "build-server-1"
+      aws_region:
+        required: false
+        type: string
+        default: "us-east-2"
+      role_to_assume:
+        description: |
+          ARN of the IAM role to assume via GitHub OIDC for ECR access. The
+          calling job must grant `id-token: write`. Authentication is OIDC-only;
+          there is no static-key fallback.
+        required: true
+        type: string
+      include_legacy_tag_pattern:
+        description: |
+          Also match the pre-BUILD_SERVER_ID legacy tag shape
+          `{target_segment}-{branch}-{sha}`. Leave off for new repos; turn on
+          only where historical tags from before the prefix change might
+          still be in the registry.
+        required: false
+        type: boolean
+        default: false
+      mode:
+        description: |
+          `reactive` (default) cleans up tags for the single branch implied by
+          the triggering event. `audit` scans every tag in each matrix entry,
+          diffs against the caller's live branches, and removes orphans —
+          intended to be scheduled (e.g. once a day).
+        required: false
+        type: string
+        default: reactive
+      dry_run:
+        description: |
+          Audit mode only. When true (default), log the tags that would be
+          deleted but don't actually delete them. Flip to false in the caller
+          once a few scheduled runs have looked sane.
+        required: false
+        type: boolean
+        default: true
+      min_tag_age_hours:
+        description: |
+          Audit mode only. Don't delete a branch's tags if its newest image
+          was pushed less than this many hours ago. Guards against deleting a
+          freshly-pushed branch whose `repos/.../branches` listing hasn't yet
+          reflected the branch, and against in-flight builds whose PR hasn't
+          been opened yet.
+        required: false
+        type: number
+        default: 24
+permissions:
+  contents: read
+  id-token: write  # OIDC: assume the caller's ECR role
+  actions: write   # cancel-builds needs to cancel sibling workflow runs
+
+jobs:
+  cancel-builds:
+    if: inputs.mode == 'reactive'
+    name: Cancel in-progress builds
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine branch name
+        id: branch-name
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          DELETE_REF: ${{ github.event.ref }}
+          DELETE_REF_TYPE: ${{ github.event.ref_type }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BRANCH_NAME="$HEAD_REF"
+          elif [ "$EVENT_NAME" = "delete" ] && [ "$DELETE_REF_TYPE" = "branch" ]; then
+            BRANCH_NAME="$DELETE_REF"
+          else
+            echo "Unsupported event type or ref type"
+            exit 1
+          fi
+          echo "branch=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Cancel in-progress build runs for this branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.branch-name.outputs.branch }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ inputs.build_workflow_name }}
+        run: |
+          echo "Cancelling any in-progress builds for branch: $BRANCH (workflow: $WORKFLOW)"
+
+          RUN_IDS=$(gh run list \
+            --repo "$REPO" \
+            --workflow "$WORKFLOW" \
+            --branch "$BRANCH" \
+            --status in_progress \
+            --json databaseId \
+            --jq '.[].databaseId' 2>/dev/null || true)
+
+          QUEUED_IDS=$(gh run list \
+            --repo "$REPO" \
+            --workflow "$WORKFLOW" \
+            --branch "$BRANCH" \
+            --status queued \
+            --json databaseId \
+            --jq '.[].databaseId' 2>/dev/null || true)
+
+          ALL_IDS=$(echo -e "${RUN_IDS}\n${QUEUED_IDS}" | grep -v '^$' || true)
+
+          if [ -z "$ALL_IDS" ]; then
+            echo "No in-progress or queued builds found."
+            exit 0
+          fi
+
+          for run_id in $ALL_IDS; do
+            echo "Cancelling run $run_id"
+            gh run cancel "$run_id" --repo "$REPO" || true
+          done
+
+          echo "Waiting for cancelled runs to stop..."
+          for run_id in $ALL_IDS; do
+            for i in $(seq 1 30); do
+              STATUS=$(gh run view "$run_id" \
+                --repo "$REPO" \
+                --json status --jq '.status' 2>/dev/null || echo "unknown")
+              if [ "$STATUS" = "completed" ]; then
+                echo "Run $run_id finished (completed)."
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                echo "Warning: run $run_id still not completed after 60s, proceeding anyway."
+              fi
+              sleep 2
+            done
+          done
+
+  cleanup-tags:
+    if: inputs.mode == 'reactive'
+    name: Cleanup ${{ matrix.entry.image }} (${{ matrix.entry.target_segment }})
+    needs: cancel-builds
+    runs-on: ubuntu-latest
+    strategy:
+      # One job per (ECR repo × target_segment) the caller built.
+      matrix:
+        entry: ${{ fromJSON(inputs.images_json) }}
+      fail-fast: false  # one repo's cleanup failing shouldn't block the others
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_to_assume }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Determine branch name
+        id: branch-name
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          DELETE_REF: ${{ github.event.ref }}
+          DELETE_REF_TYPE: ${{ github.event.ref_type }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BRANCH_NAME="$HEAD_REF"
+          elif [ "$EVENT_NAME" = "delete" ] && [ "$DELETE_REF_TYPE" = "branch" ]; then
+            BRANCH_NAME="$DELETE_REF"
+          else
+            echo "Unsupported event type or ref type"
+            exit 1
+          fi
+
+          # docker/metadata-action sanitizes branch names by replacing / with -;
+          # mirror that here so the tag prefix we match is the same one the
+          # build workflow produced.
+          SANITIZED_BRANCH=$(echo "$BRANCH_NAME" | sed 's/\//-/g')
+          echo "branch-name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+          echo "sanitized-branch=$SANITIZED_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Branch name: $BRANCH_NAME (sanitized: $SANITIZED_BRANCH)" >&2
+
+      - name: List and remove ECR tags
+        env:
+          REPOSITORY: ${{ matrix.entry.image }}
+          TARGET_SEGMENT: ${{ matrix.entry.target_segment }}
+          BUILD_SERVER_ID: ${{ inputs.build_server_id }}
+          SANITIZED_BRANCH: ${{ steps.branch-name.outputs.sanitized-branch }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          INCLUDE_LEGACY: ${{ inputs.include_legacy_tag_pattern }}
+        run: |
+          set -euo pipefail
+          # Primary tag pattern: {build_server_id}-{target_segment}-{branch}-
+          PATTERN_NEW="${BUILD_SERVER_ID}-${TARGET_SEGMENT}-${SANITIZED_BRANCH}-"
+          # Optional legacy pattern (pre-BUILD_SERVER_ID): {target_segment}-{branch}-
+          PATTERN_LEGACY="${TARGET_SEGMENT}-${SANITIZED_BRANCH}-"
+
+          echo "Looking for tags matching: ${PATTERN_NEW}*"
+          if [ "$INCLUDE_LEGACY" = "true" ]; then
+            echo "  (also matching legacy ${PATTERN_LEGACY}*)"
+          fi
+          echo "Repository: $REPOSITORY"
+
+          if ! aws ecr describe-repositories \
+            --repository-names "$REPOSITORY" \
+            --region "$AWS_REGION" \
+            >/dev/null 2>&1; then
+            echo "Repository $REPOSITORY does not exist in ECR, skipping cleanup"
+            exit 0
+          fi
+
+          IMAGE_TAGS=$(aws ecr list-images \
+            --repository-name "$REPOSITORY" \
+            --region "$AWS_REGION" \
+            --query 'imageIds[?imageTag!=null].imageTag' \
+            --output json 2>/dev/null || echo "[]")
+
+          if [ "$INCLUDE_LEGACY" = "true" ]; then
+            MATCHING_TAGS=$(echo "$IMAGE_TAGS" | jq -r \
+              --arg p1 "$PATTERN_NEW" \
+              --arg p2 "$PATTERN_LEGACY" \
+              '.[] | select(startswith($p1) or startswith($p2))')
+          else
+            MATCHING_TAGS=$(echo "$IMAGE_TAGS" | jq -r \
+              --arg p1 "$PATTERN_NEW" \
+              '.[] | select(startswith($p1))')
+          fi
+
+          if [ -z "$MATCHING_TAGS" ]; then
+            echo "No matching tags found."
+            exit 0
+          fi
+
+          echo "Found tags to remove:"
+          echo "$MATCHING_TAGS"
+
+          echo "$MATCHING_TAGS" | while read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "Removing tag: $tag"
+              aws ecr batch-delete-image \
+                --repository-name "$REPOSITORY" \
+                --region "$AWS_REGION" \
+                --image-ids imageTag="$tag" || echo "Failed to remove tag: $tag"
+            fi
+          done
+
+          echo "✓ Cleanup completed for ${REPOSITORY} (${TARGET_SEGMENT}) on ${SANITIZED_BRANCH}"
+
+  audit-tags:
+    if: inputs.mode == 'audit'
+    name: Audit ${{ matrix.entry.image }} (${{ matrix.entry.target_segment }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        entry: ${{ fromJSON(inputs.images_json) }}
+      fail-fast: false  # one entry's audit failing shouldn't block the others
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_to_assume }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Find and (optionally) delete orphan branch tags
+        env:
+          REPOSITORY: ${{ matrix.entry.image }}
+          TARGET_SEGMENT: ${{ matrix.entry.target_segment }}
+          BUILD_SERVER_ID: ${{ inputs.build_server_id }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          INCLUDE_LEGACY: ${{ inputs.include_legacy_tag_pattern }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MIN_AGE_HOURS: ${{ inputs.min_tag_age_hours }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          PREFIX_NEW="${BUILD_SERVER_ID}-${TARGET_SEGMENT}-"
+          PREFIX_LEGACY="${TARGET_SEGMENT}-"
+          echo "Auditing $REPOSITORY for prefix: $PREFIX_NEW"
+          if [ "$INCLUDE_LEGACY" = "true" ]; then
+            echo "  (also matching legacy $PREFIX_LEGACY)"
+          fi
+
+          if ! aws ecr describe-repositories \
+            --repository-names "$REPOSITORY" \
+            --region "$AWS_REGION" \
+            >/dev/null 2>&1; then
+            echo "Repository $REPOSITORY does not exist in ECR, skipping audit"
+            exit 0
+          fi
+
+          # aws-cli v2 auto-paginates when --max-items / --no-paginate are not
+          # set. We need both the tag list and imagePushedAt for the age floor.
+          IMAGE_DETAILS=$(aws ecr describe-images \
+            --repository-name "$REPOSITORY" \
+            --region "$AWS_REGION" \
+            --output json \
+            --query 'imageDetails[?imageTags!=null].{tags: imageTags, pushed: imagePushedAt}')
+
+          # Per-matching-tag rows, with branch slug derived by stripping the
+          # known prefix and the trailing -{shortsha}. Then collapse to one
+          # row per branch with the full tag list and the newest push time.
+          BRANCH_INFO=$(jq -r \
+            --arg p1 "$PREFIX_NEW" \
+            --arg p2 "$PREFIX_LEGACY" \
+            --argjson include_legacy "$( [ "$INCLUDE_LEGACY" = "true" ] && echo true || echo false )" '
+            [ .[]
+              | . as $row
+              | .tags[]
+              | select(startswith($p1) or ($include_legacy and startswith($p2)))
+              | {
+                  tag: .,
+                  pushed: $row.pushed,
+                  branch:
+                    (if startswith($p1) then ltrimstr($p1) else ltrimstr($p2) end)
+                    | sub("-[0-9a-f]{7,}$"; "")
+                }
+            ]
+            | group_by(.branch)
+            | map({
+                branch: .[0].branch,
+                tags: [.[].tag],
+                newest_pushed: (max_by(.pushed) | .pushed)
+              })
+          ' <<<"$IMAGE_DETAILS")
+
+          BRANCH_COUNT=$(jq 'length' <<<"$BRANCH_INFO")
+          if [ "$BRANCH_COUNT" = "0" ]; then
+            echo "No matching tags found in ECR; nothing to audit."
+            exit 0
+          fi
+          echo "Found $BRANCH_COUNT branch(es) with tags in ECR for this matrix entry."
+
+          # Live branch list from the calling repo, sanitized the same way
+          # docker/metadata-action does (/ -> -). `gh api --paginate` walks
+          # every page.
+          LIVE_BRANCHES=$(gh api --paginate "repos/$REPO/branches" --jq '.[].name' \
+            | tr '/' '-' \
+            | sort -u)
+          LIVE_COUNT=$(printf '%s\n' "$LIVE_BRANCHES" | grep -c . || true)
+          echo "Calling repo has $LIVE_COUNT live branch(es)."
+
+          CUTOFF_EPOCH=$(date -d "$MIN_AGE_HOURS hours ago" +%s)
+          DELETED_ANY=false
+
+          # shellcheck disable=SC2030,SC2031
+          while IFS= read -r entry; do
+            branch=$(jq -r '.branch' <<<"$entry")
+            newest=$(jq -r '.newest_pushed' <<<"$entry")
+            tags=$(jq -r '.tags[]' <<<"$entry")
+
+            if printf '%s\n' "$LIVE_BRANCHES" | grep -Fxq "$branch"; then
+              continue
+            fi
+
+            pushed_epoch=$(date -d "$newest" +%s 2>/dev/null || echo 0)
+            if [ "$pushed_epoch" -ge "$CUTOFF_EPOCH" ]; then
+              echo "Skip $branch — newest tag pushed $newest, within ${MIN_AGE_HOURS}h floor"
+              continue
+            fi
+
+            echo "Orphan: $branch (newest pushed $newest)"
+            printf '%s\n' "$tags" | sed 's/^/    /'
+
+            if [ "$DRY_RUN" != "true" ]; then
+              DELETED_ANY=true
+              printf '%s\n' "$tags" | while IFS= read -r tag; do
+                [ -z "$tag" ] && continue
+                aws ecr batch-delete-image \
+                  --repository-name "$REPOSITORY" \
+                  --region "$AWS_REGION" \
+                  --image-ids imageTag="$tag" \
+                  || echo "    Failed to remove tag: $tag"
+              done
+            fi
+          done < <(jq -c '.[]' <<<"$BRANCH_INFO")
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "DRY RUN: no tags were actually deleted. Set dry_run=false in the caller to apply."
+          elif [ "$DELETED_ANY" = "false" ]; then
+            echo "No orphan tags older than ${MIN_AGE_HOURS}h."
+          else
+            echo "✓ Audit cleanup completed for ${REPOSITORY} (${TARGET_SEGMENT})"
+          fi
