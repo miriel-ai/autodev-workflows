@@ -34,11 +34,11 @@ on:
         description: |
           JSON array of `{image, target_segment}` objects, one per ECR-repo ×
           tag-segment combination the calling repo builds. Each entry produces
-          one cleanup job. Example for leeloo:
-            '[{"image":"miriel/services","target_segment":"api-dev"},
-              {"image":"miriel/services","target_segment":"services-dev"},
-              {"image":"miriel/dashboard","target_segment":"dev"},
-              {"image":"miriel/dashboard","target_segment":"prod"}]'
+          one cleanup job. Example:
+            '[{"image":"my-org/services","target_segment":"api-dev"},
+              {"image":"my-org/services","target_segment":"services-dev"},
+              {"image":"my-org/dashboard","target_segment":"dev"},
+              {"image":"my-org/dashboard","target_segment":"prod"}]'
         required: true
         type: string
       build_workflow_name:
