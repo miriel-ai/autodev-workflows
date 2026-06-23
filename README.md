@@ -73,10 +73,13 @@ you need an immutable reference.
 
 ## What is *not* here
 
-`comment-deployment-url.yml` (the PR preview comment + GitHub Deployment) is
-**not** mirrored here. Cross-org, the deploy-controller posts it server-side via
-its GitHub App; same-org callers use the private copy in miriel-infra. Only
-workflows that *must* run in the customer's own CI live in this public repo.
+There is no `comment-deployment-url.yml`. The PR preview comment + GitHub
+Deployment record used to be a reusable workflow a caller invoked, but the
+deploy-controller now renders that surface (every routed host — dashboard,
+`-api`, `-anor`) and posts it **server-side via its GitHub App, for every
+org**. There is nothing left for a calling repo to mirror, so the workflow has
+been retired. Only workflows that *must* run in the caller's own CI (e.g. the
+ECR tag cleanup above) live in this public repo.
 
 ## Full model
 
