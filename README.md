@@ -56,6 +56,25 @@ caller passes `role_to_assume` (the ARN of an IAM role whose trust policy lets
 this repo's OIDC token mint ECR credentials) and grants the calling job
 `id-token: write`. The workflow holds no secrets of its own.
 
+`role_to_assume` can come from a repository **variable** (as an input under
+`with:`, above) or from a repository **secret**. GitHub does not expose the
+`secrets` context inside a caller's `with:` block, so a repo that keeps the ARN
+as a secret passes it through the job's `secrets:` block instead — same name,
+different block:
+
+```yaml
+    uses: miriel-ai/autodev-workflows/.github/workflows/cleanup-ecr-tags.yml@v1
+    with:
+      images_json: '[{"image":"<org>/<ecr-repo>","target_segment":"dev"}]'
+      build_workflow_name: build-and-push-to-ecr.yml
+    secrets:
+      role_to_assume: ${{ secrets.AWS_ECR_ROLE_ARN }}
+```
+
+Pass one or the other; the secret takes precedence if both are set, and the
+run fails up front with a clear error if neither is. (`secrets: inherit` also
+works, provided the caller's secret is literally named `role_to_assume`.)
+
 For a daily orphan sweep, add a second `schedule`-triggered job that passes
 `mode: audit` (and, once a few dry runs look sane, `dry_run: false`). See the
 workflow's input descriptions for the audit-mode and legacy-tag knobs.

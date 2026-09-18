@@ -64,8 +64,16 @@ on:
           ARN of the IAM role to assume via GitHub OIDC for ECR access. The
           calling job must grant `id-token: write`. Authentication is OIDC-only;
           there is no static-key fallback.
-        required: true
+
+          Pass the ARN either here (e.g. from a repository *variable*) or as
+          the `role_to_assume` workflow_call *secret* below (e.g. from a
+          repository *secret*). GitHub does not expose the `secrets` context
+          in a caller's `with:` block, so a caller that stores the ARN as a
+          secret must use the `secrets:` block instead. The secret wins when
+          both are set; the run fails early if neither is.
+        required: false
         type: string
+        default: ""
       include_legacy_tag_pattern:
         description: |
           Also match the pre-BUILD_SERVER_ID legacy tag shape
@@ -102,6 +110,15 @@ on:
         required: false
         type: number
         default: 24
+    secrets:
+      role_to_assume:
+        description: |
+          Same as the `role_to_assume` input, for callers that keep the ECR
+          role ARN in a repository/org *secret* rather than a variable — pass
+          it under `secrets:` (not `with:`) in the calling job. Takes
+          precedence over the input when both are set. A caller using
+          `secrets: inherit` must expose the ARN under this exact name.
+        required: false
 permissions:
   contents: read
   id-token: write  # OIDC: assume the caller's ECR role
@@ -196,10 +213,21 @@ jobs:
         entry: ${{ fromJSON(inputs.images_json) }}
       fail-fast: false  # one repo's cleanup failing shouldn't block the others
     steps:
+      - name: Check an ECR role ARN was supplied
+        env:
+          ROLE_TO_ASSUME: ${{ secrets.role_to_assume || inputs.role_to_assume }}
+        run: |
+          if [ -z "$ROLE_TO_ASSUME" ]; then
+            echo "::error::No ECR role ARN supplied. Pass role_to_assume either in the caller's 'secrets:' block (from a repository secret) or in its 'with:' block (from a repository variable)."
+            exit 1
+          fi
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ inputs.role_to_assume }}
+          # The secret (if the caller passed one) wins over the input; see the
+          # `role_to_assume` input/secret descriptions above.
+          role-to-assume: ${{ secrets.role_to_assume || inputs.role_to_assume }}
           aws-region: ${{ inputs.aws_region }}
 
       - name: Determine branch name
@@ -302,10 +330,21 @@ jobs:
         entry: ${{ fromJSON(inputs.images_json) }}
       fail-fast: false  # one entry's audit failing shouldn't block the others
     steps:
+      - name: Check an ECR role ARN was supplied
+        env:
+          ROLE_TO_ASSUME: ${{ secrets.role_to_assume || inputs.role_to_assume }}
+        run: |
+          if [ -z "$ROLE_TO_ASSUME" ]; then
+            echo "::error::No ECR role ARN supplied. Pass role_to_assume either in the caller's 'secrets:' block (from a repository secret) or in its 'with:' block (from a repository variable)."
+            exit 1
+          fi
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ inputs.role_to_assume }}
+          # The secret (if the caller passed one) wins over the input; see the
+          # `role_to_assume` input/secret descriptions above.
+          role-to-assume: ${{ secrets.role_to_assume || inputs.role_to_assume }}
           aws-region: ${{ inputs.aws_region }}
 
       - name: Find and (optionally) delete orphan branch tags
