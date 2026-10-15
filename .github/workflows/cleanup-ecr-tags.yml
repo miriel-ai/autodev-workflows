@@ -14,7 +14,10 @@
 #     and (optionally) deletes the orphans. Catches the cases the reactive
 #     path drops on the floor — dropped webhooks, force-pushes, partial
 #     cleanups, runs that errored mid-batch, branches deleted via API without
-#     firing the events we listen for.
+#     firing the events we listen for. A branch that still exists but whose
+#     every PR is closed or merged (none open) is treated as orphaned too,
+#     after a grace period — catching branches recreated by a push during or
+#     after the merge, which otherwise hold their preview alive forever.
 #
 # Without this, the deploy-controller's "tag deleted from ECR → tear down the
 # stack" path only fires once its next poll sees no matching tags, so the last
@@ -110,6 +113,27 @@ on:
         required: false
         type: number
         default: 24
+      pr_closed_grace_hours:
+        description: |
+          Audit mode only. A branch that still exists is also treated as
+          orphaned when it has at least one pull request, every PR whose head
+          is that branch (in the calling repo — fork PRs don't count) is
+          closed or merged, and the most recent one closed more than this
+          many hours ago. The grace period keeps a just-merged PR's preview
+          from being yanked mid-review. A branch with no PRs at all, or with
+          any open PR, is never reaped this way.
+        required: false
+        type: number
+        default: 24
+      delete_stale_branches:
+        description: |
+          Audit mode only. When a still-existing branch is reaped because all
+          its PRs are closed/merged, also delete the branch itself from the
+          calling repo. Honors dry_run. Requires the calling job to grant
+          `contents: write`. Off by default.
+        required: false
+        type: boolean
+        default: false
     secrets:
       role_to_assume:
         description: |
@@ -119,10 +143,13 @@ on:
           precedence over the input when both are set. A caller using
           `secrets: inherit` must expose the ARN under this exact name.
         required: false
-permissions:
-  contents: read
-  id-token: write  # OIDC: assume the caller's ECR role
-  actions: write   # cancel-builds needs to cancel sibling workflow runs
+# GITHUB_TOKEN permissions are inherited from the calling job. (A reusable
+# workflow may only downgrade what the caller grants; declaring a fixed set
+# here would either clamp `contents` to read — breaking delete_stale_branches —
+# or demand `contents: write` from every caller.) The calling job should grant:
+#   contents: read   # write instead, if delete_stale_branches is used
+#   id-token: write  # OIDC: assume the caller's ECR role
+#   actions: write   # cancel-builds needs to cancel sibling workflow runs
 
 jobs:
   cancel-builds:
@@ -356,6 +383,8 @@ jobs:
           INCLUDE_LEGACY: ${{ inputs.include_legacy_tag_pattern }}
           DRY_RUN: ${{ inputs.dry_run }}
           MIN_AGE_HOURS: ${{ inputs.min_tag_age_hours }}
+          PR_CLOSED_GRACE_HOURS: ${{ inputs.pr_closed_grace_hours }}
+          DELETE_STALE_BRANCHES: ${{ inputs.delete_stale_branches }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
@@ -418,16 +447,19 @@ jobs:
           fi
           echo "Found $BRANCH_COUNT branch(es) with tags in ECR for this matrix entry."
 
-          # Live branch list from the calling repo, sanitized the same way
-          # docker/metadata-action does (/ -> -). `gh api --paginate` walks
-          # every page.
-          LIVE_BRANCHES=$(gh api --paginate "repos/$REPO/branches" --jq '.[].name' \
-            | tr '/' '-' \
-            | sort -u)
+          # Live branch list from the calling repo. Keep the real ref names
+          # (needed for PR lookups and optional branch deletion) alongside the
+          # docker/metadata-action-sanitized form (/ -> -) that the tag slugs
+          # use; several real branches can sanitize to the same slug. `gh api
+          # --paginate` walks every page.
+          LIVE_BRANCHES_RAW=$(gh api --paginate "repos/$REPO/branches" --jq '.[].name' | sort -u)
+          LIVE_BRANCHES=$(printf '%s\n' "$LIVE_BRANCHES_RAW" | tr '/' '-' | sort -u)
           LIVE_COUNT=$(printf '%s\n' "$LIVE_BRANCHES" | grep -c . || true)
           echo "Calling repo has $LIVE_COUNT live branch(es)."
 
+          OWNER=${REPO%%/*}
           CUTOFF_EPOCH=$(date -d "$MIN_AGE_HOURS hours ago" +%s)
+          PR_CUTOFF_EPOCH=$(date -d "$PR_CLOSED_GRACE_HOURS hours ago" +%s)
           DELETED_ANY=false
 
           # shellcheck disable=SC2030,SC2031
@@ -436,8 +468,58 @@ jobs:
             newest=$(jq -r '.newest_pushed' <<<"$entry")
             tags=$(jq -r '.tags[]' <<<"$entry")
 
+            reason="branch deleted"
+            stale_real_branches=""
             if printf '%s\n' "$LIVE_BRANCHES" | grep -Fxq "$branch"; then
-              continue
+              # The branch still exists. Normally that keeps its tags — but a
+              # branch recreated by a push during/after its PR merged (common
+              # with delete-branch-on-merge) would otherwise hold its preview
+              # alive forever. Treat a live branch as orphaned too when it has
+              # at least one PR, every PR whose head is that branch is closed
+              # or merged, and the most recent one closed more than
+              # PR_CLOSED_GRACE_HOURS ago. A branch with no PRs at all, or
+              # with any open PR, is always kept.
+              keep=false
+              matched=false
+              while IFS= read -r real; do
+                [ -z "$real" ] && continue
+                [ "$(printf '%s' "$real" | tr '/' '-')" = "$branch" ] || continue
+                matched=true
+                # Only PRs whose head lives in the calling repo count: the
+                # head filter is "$OWNER:$real", so a fork's PR that happens
+                # to reuse the branch name neither keeps nor reaps these tags.
+                head_q=$(jq -rn --arg v "$OWNER:$real" '$v|@uri')
+                if ! PR_ROWS=$(gh api --paginate \
+                      "repos/$REPO/pulls?state=all&per_page=100&head=$head_q" \
+                      --jq '.[] | [.state, (.closed_at // "")] | @tsv' </dev/null); then
+                  echo "Keep $branch — PR lookup failed for '$real'; keeping to be safe"
+                  keep=true
+                  break
+                fi
+                if [ -z "$PR_ROWS" ]; then
+                  # No PRs from this branch at all: a live branch keeps its
+                  # tags, exactly as before this check existed.
+                  keep=true
+                  break
+                fi
+                if cut -f1 <<<"$PR_ROWS" | grep -Fxq open; then
+                  # Branch reused by a new PR: the open PR wins.
+                  keep=true
+                  break
+                fi
+                last_closed=$(cut -f2 <<<"$PR_ROWS" | sort | tail -n1)
+                last_closed_epoch=$(date -d "$last_closed" +%s 2>/dev/null || echo "")
+                if [ -z "$last_closed_epoch" ] || [ "$last_closed_epoch" -ge "$PR_CUTOFF_EPOCH" ]; then
+                  echo "Skip $branch — last PR closed ${last_closed:-at unknown time}, within ${PR_CLOSED_GRACE_HOURS}h grace"
+                  keep=true
+                  break
+                fi
+                stale_real_branches="${stale_real_branches}${real}"$'\n'
+              done <<<"$LIVE_BRANCHES_RAW"
+              if [ "$keep" = "true" ] || [ "$matched" != "true" ]; then
+                continue
+              fi
+              reason="all PRs closed/merged"
             fi
 
             pushed_epoch=$(date -d "$newest" +%s 2>/dev/null || echo 0)
@@ -446,7 +528,7 @@ jobs:
               continue
             fi
 
-            echo "Orphan: $branch (newest pushed $newest)"
+            echo "Orphan ($reason): $branch (newest pushed $newest)"
             printf '%s\n' "$tags" | sed 's/^/    /'
 
             if [ "$DRY_RUN" != "true" ]; then
@@ -458,6 +540,22 @@ jobs:
                   --region "$AWS_REGION" \
                   --image-ids imageTag="$tag" \
                   || echo "    Failed to remove tag: $tag"
+              done
+            fi
+
+            if [ "$DELETE_STALE_BRANCHES" = "true" ] && [ -n "$stale_real_branches" ]; then
+              printf '%s\n' "$stale_real_branches" | while IFS= read -r real; do
+                [ -z "$real" ] && continue
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "    DRY RUN: would delete branch $real"
+                else
+                  # Needs `contents: write` on the calling job's token. Another
+                  # matrix entry may have deleted the branch already; that (or
+                  # a missing grant) surfaces as a non-fatal failure here.
+                  gh api -X DELETE "repos/$REPO/git/refs/heads/$real" </dev/null \
+                    && echo "    Deleted branch $real" \
+                    || echo "    Failed to delete branch $real (already deleted, or caller lacks contents: write?)"
+                fi
               done
             fi
           done < <(jq -c '.[]' <<<"$BRANCH_INFO")
