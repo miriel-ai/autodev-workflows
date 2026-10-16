@@ -143,19 +143,25 @@ on:
           precedence over the input when both are set. A caller using
           `secrets: inherit` must expose the ARN under this exact name.
         required: false
-# GITHUB_TOKEN permissions are inherited from the calling job. (A reusable
-# workflow may only downgrade what the caller grants; declaring a fixed set
-# here would either clamp `contents` to read — breaking delete_stale_branches —
-# or demand `contents: write` from every caller.) The calling job should grant:
-#   contents: read   # write instead, if delete_stale_branches is used
-#   id-token: write  # OIDC: assume the caller's ECR role
-#   actions: write   # cancel-builds needs to cancel sibling workflow runs
+# GITHUB_TOKEN permissions: a reusable workflow can only keep or downgrade
+# what the calling job grants. The reactive jobs below declare their own
+# least-privilege sets. The audit job declares none and inherits the caller's
+# grants, because a fixed set would either clamp `contents` to read (breaking
+# delete_stale_branches) or demand `contents: write` from every caller. A
+# calling job should grant:
+#   contents: read        # write instead, if delete_stale_branches is used
+#   id-token: write       # OIDC: assume the caller's ECR role
+#   actions: write        # reactive mode: cancel sibling build runs
+#   pull-requests: read   # audit mode: look up a live branch's PRs
 
 jobs:
   cancel-builds:
     if: inputs.mode == 'reactive'
     name: Cancel in-progress builds
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write  # cancel sibling workflow runs
     steps:
       - name: Determine branch name
         id: branch-name
@@ -234,6 +240,9 @@ jobs:
     name: Cleanup ${{ matrix.entry.image }} (${{ matrix.entry.target_segment }})
     needs: cancel-builds
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # OIDC: assume the caller's ECR role
     strategy:
       # One job per (ECR repo × target_segment) the caller built.
       matrix:
@@ -452,7 +461,17 @@ jobs:
           # docker/metadata-action-sanitized form (/ -> -) that the tag slugs
           # use; several real branches can sanitize to the same slug. `gh api
           # --paginate` walks every page.
-          LIVE_BRANCHES_RAW=$(gh api --paginate "repos/$REPO/branches" --jq '.[].name' | sort -u)
+          BRANCH_ROWS=$(gh api --paginate "repos/$REPO/branches" --jq '.[] | [.name, .protected] | @tsv')
+          LIVE_BRANCHES_RAW=$(cut -f1 <<<"$BRANCH_ROWS" | sort -u)
+          # Branches the PR-closed rule must never reap: the default branch
+          # (its tags share the preview tag shape, and a PR *from* it, e.g. a
+          # release PR, may well be closed) and any protected branch.
+          DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq '.default_branch')
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "::error::Could not determine the default branch of $REPO"
+            exit 1
+          fi
+          PROTECTED_BRANCHES=$(awk -F'\t' '$2 == "true" { print $1 }' <<<"$BRANCH_ROWS")
           LIVE_BRANCHES=$(printf '%s\n' "$LIVE_BRANCHES_RAW" | tr '/' '-' | sort -u)
           LIVE_COUNT=$(printf '%s\n' "$LIVE_BRANCHES" | grep -c . || true)
           echo "Calling repo has $LIVE_COUNT live branch(es)."
@@ -485,6 +504,12 @@ jobs:
                 [ -z "$real" ] && continue
                 [ "$(printf '%s' "$real" | tr '/' '-')" = "$branch" ] || continue
                 matched=true
+                if [ "$real" = "$DEFAULT_BRANCH" ] || printf '%s\n' "$PROTECTED_BRANCHES" | grep -Fxq -- "$real"; then
+                  # Default/protected branches are long-lived by design: a
+                  # live one always keeps its tags, whatever its PRs say.
+                  keep=true
+                  break
+                fi
                 # Only PRs whose head lives in the calling repo count: the
                 # head filter is "$OWNER:$real", so a fork's PR that happens
                 # to reuse the branch name neither keeps nor reaps these tags.

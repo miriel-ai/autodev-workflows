@@ -91,9 +91,33 @@ indefinitely. It is guarded by:
   **open PR wins** — a branch reused by a new PR is never reaped. Only PRs
   whose head lives in the calling repo count; a fork's PR that reuses the
   branch name neither keeps nor reaps the tags.
+* The repository's **default branch** and any **protected branch** are never
+  reaped by this rule, whatever their PRs say. If a PR lookup fails, the
+  branch is kept.
 * `delete_stale_branches` (default `false`): when such a branch is reaped,
   also delete the branch itself. This needs the calling job to grant
   `contents: write` instead of `contents: read`.
+
+The PR lookup needs the audit job's token to read pull requests, so a
+private calling repo should add `pull-requests: read` to the audit job's
+`permissions` (without it every lookup fails and live branches are simply
+kept, as before):
+
+```yaml
+  audit:
+    permissions:
+      contents: read        # write, if delete_stale_branches: true
+      id-token: write
+      pull-requests: read
+    uses: miriel-ai/autodev-workflows/.github/workflows/cleanup-ecr-tags.yml@v1
+    with:
+      mode: audit
+      images_json: '[{"image":"<org>/<ecr-repo>","target_segment":"dev"}]'
+      build_workflow_name: build-and-push-to-ecr.yml
+      role_to_assume: ${{ vars.AUTODEV_ECR_ROLE_ARN }}
+      # dry_run: false              # once a few dry runs look sane
+      # pr_closed_grace_hours: 24   # default
+```
 
 `dry_run` (default `true`) stays report-only throughout: it lists the tags —
 and, with `delete_stale_branches`, the branches — that would be reaped without
