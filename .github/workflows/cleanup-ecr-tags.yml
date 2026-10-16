@@ -151,7 +151,8 @@ on:
 # calling job should grant:
 #   contents: read        # write instead, if delete_stale_branches is used
 #   id-token: write       # OIDC: assume the caller's ECR role
-#   actions: write        # reactive mode: cancel sibling build runs
+#   actions: write        # cancel-builds; required in audit mode too, since
+#                         # GitHub validates every job's grants up front
 #   pull-requests: read   # audit mode: look up a live branch's PRs
 
 jobs:
@@ -489,7 +490,10 @@ jobs:
 
             reason="branch deleted"
             stale_real_branches=""
-            if printf '%s\n' "$LIVE_BRANCHES" | grep -Fxq "$branch"; then
+            # Membership checks below read here-strings rather than pipes: under
+            # pipefail, `producer | grep -q` can fail with SIGPIPE when grep
+            # exits on an early match, turning a "keep" into a false negative.
+            if grep -Fxq -- "$branch" <<<"$LIVE_BRANCHES"; then
               # The branch still exists. Normally that keeps its tags — but a
               # branch recreated by a push during/after its PR merged (common
               # with delete-branch-on-merge) would otherwise hold its preview
@@ -504,7 +508,7 @@ jobs:
                 [ -z "$real" ] && continue
                 [ "$(printf '%s' "$real" | tr '/' '-')" = "$branch" ] || continue
                 matched=true
-                if [ "$real" = "$DEFAULT_BRANCH" ] || printf '%s\n' "$PROTECTED_BRANCHES" | grep -Fxq -- "$real"; then
+                if [ "$real" = "$DEFAULT_BRANCH" ] || grep -Fxq -- "$real" <<<"$PROTECTED_BRANCHES"; then
                   # Default/protected branches are long-lived by design: a
                   # live one always keeps its tags, whatever its PRs say.
                   keep=true
@@ -527,7 +531,7 @@ jobs:
                   keep=true
                   break
                 fi
-                if cut -f1 <<<"$PR_ROWS" | grep -Fxq open; then
+                if grep -q $'^open\t' <<<"$PR_ROWS"; then
                   # Branch reused by a new PR: the open PR wins.
                   keep=true
                   break

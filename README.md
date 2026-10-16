@@ -108,6 +108,7 @@ kept, as before):
     permissions:
       contents: read        # write, if delete_stale_branches: true
       id-token: write
+      actions: write        # validated for every job, even in audit mode
       pull-requests: read
     uses: miriel-ai/autodev-workflows/.github/workflows/cleanup-ecr-tags.yml@v1
     with:
