@@ -506,7 +506,7 @@ jobs:
               matched=false
               while IFS= read -r real; do
                 [ -z "$real" ] && continue
-                [ "$(printf '%s' "$real" | tr '/' '-')" = "$branch" ] || continue
+                [ "${real//\//-}" = "$branch" ] || continue
                 matched=true
                 if [ "$real" = "$DEFAULT_BRANCH" ] || grep -Fxq -- "$real" <<<"$PROTECTED_BRANCHES"; then
                   # Default/protected branches are long-lived by design: a
@@ -514,13 +514,15 @@ jobs:
                   keep=true
                   break
                 fi
-                # Only PRs whose head lives in the calling repo count: the
-                # head filter is "$OWNER:$real", so a fork's PR that happens
-                # to reuse the branch name neither keeps nor reaps these tags.
+                # Only PRs whose head lives in the calling repo count, so a
+                # fork's PR that happens to reuse the branch name neither keeps
+                # nor reaps these tags. The "$OWNER:$real" head filter narrows
+                # by owner + ref; the jq select pins the exact head repo (it
+                # also drops PRs whose head repo was deleted, where it's null).
                 head_q=$(jq -rn --arg v "$OWNER:$real" '$v|@uri')
                 if ! PR_ROWS=$(gh api --paginate \
                       "repos/$REPO/pulls?state=all&per_page=100&head=$head_q" \
-                      --jq '.[] | [.state, (.closed_at // "")] | @tsv' </dev/null); then
+                      --jq ".[] | select(.head.repo.full_name == \"$REPO\") | [.state, (.closed_at // \"\")] | @tsv" </dev/null); then
                   echo "Keep $branch — PR lookup failed for '$real'; keeping to be safe"
                   keep=true
                   break
