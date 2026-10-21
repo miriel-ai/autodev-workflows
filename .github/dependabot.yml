@@ -1,0 +1,20 @@
+# Dependabot: weekly reviewed dependency refreshes (miriel-ai/shepherd-control#9).
+#
+# - github-actions covers the workflows under .github/workflows/.
+#
+# Minor and patch version updates are grouped per ecosystem so the weekly PR
+# count stays small; security updates stay ungrouped (groups below apply to
+# version updates only), so each security fix arrives as its own PR.
+# Triage of these PRs belongs to Dependabot Shepherd
+# (miriel-ai/dependabot-shepherd).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
