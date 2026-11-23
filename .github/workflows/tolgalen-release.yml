@@ -63,10 +63,15 @@ on:
         type: boolean
         default: false
       api_url:
-        description: The autodev control plane (no trailing slash).
+        description: >-
+          The autodev control plane the environment lives on (no trailing slash).
+          Defaults to the prod plane, https://autodev.miriel.ai, where prod and
+          customer environments live. An environment on the dev plane (Miriel's
+          own dev tier) needs https://autodev.builds.miriel.ai. A token is valid
+          on one plane only, so the wrong plane fails with 401.
         required: false
         type: string
-        default: https://autodev.builds.miriel.ai
+        default: https://autodev.miriel.ai
     secrets:
       deploy_token:
         description: The per-environment deploy token (adep_…) an org admin minted in the console.
