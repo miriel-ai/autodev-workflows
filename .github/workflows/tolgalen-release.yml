@@ -1,0 +1,157 @@
+# tolgalen-release.yml — reusable workflow: cut (and optionally activate) a
+# Tol Galen release from a repo's own CI with a per-environment deploy token.
+#
+# Lives in the PUBLIC miriel-ai/autodev-workflows repo (as
+# .github/workflows/tolgalen-release.yml, tagged v1) so an app repo in ANY
+# GitHub org can `uses:` it — a private repo's reusable workflows are callable
+# only from the same org. The copy under miriel-infra/docs/autodev-workflows/
+# is the source of record for review; publish it to autodev-workflows
+# unchanged (see docs/tolgalen-deploy-tokens.md).
+#
+# Caller sketch (after its image build + push):
+#
+#   deploy-dev:
+#     needs: build
+#     uses: miriel-ai/autodev-workflows/.github/workflows/tolgalen-release.yml@v1
+#     with:
+#       environment: widget-dev
+#       images: '{"frontend_tag": "${{ needs.build.outputs.web_tag }}", "backend_tag": "${{ needs.build.outputs.api_tag }}"}'
+#       commit: ${{ github.sha }}
+#       activate: true
+#     secrets:
+#       deploy_token: ${{ secrets.TOLGALEN_DEPLOY_TOKEN_DEV }}
+#
+# Either `images` (tags per slot, as the component declares its slots) or
+# `branch` (the control plane resolves the branch's newest built tags, or —
+# with `commit` — that commit's build). `activate` defaults to false: CI
+# stages the release and a human or an agent activates it; a dev token
+# minted with the `activate` scope may activate from CI; a prod token is
+# cut-only unless an org admin granted `activate` at mint.
+
+name: Tol Galen release
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: The Tol Galen environment the deploy token was minted for (e.g. widget-dev).
+        required: true
+        type: string
+      images:
+        description: 'JSON object of image tags per slot, e.g. {"frontend_tag": "…", "backend_tag": "…"}. Mutually exclusive with `branch`.'
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: The built branch whose tags the control plane resolves (newest build, or the `commit` given).
+        required: false
+        type: string
+        default: ""
+      commit:
+        description: The commit the images were built from (github.sha). Recorded as provenance; required for a prod activation.
+        required: false
+        type: string
+        default: ""
+      notes:
+        description: Free text recorded on the release.
+        required: false
+        type: string
+        default: ""
+      activate:
+        description: Also make the release the running one (needs the token's `activate` scope).
+        required: false
+        type: boolean
+        default: false
+      api_url:
+        description: The autodev control plane (no trailing slash).
+        required: false
+        type: string
+        default: https://autodev.builds.miriel.ai
+    secrets:
+      deploy_token:
+        description: The per-environment deploy token (adep_…) an org admin minted in the console.
+        required: true
+    outputs:
+      sequence:
+        description: The release sequence cut (or activated).
+        value: ${{ jobs.release.outputs.sequence }}
+      url:
+        description: Where the environment's active release serves.
+        value: ${{ jobs.release.outputs.url }}
+      activated:
+        description: Whether this run activated the release.
+        value: ${{ jobs.release.outputs.activated }}
+
+jobs:
+  release:
+    name: Cut ${{ inputs.activate && 'and activate ' || '' }}release → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      sequence: ${{ steps.cut.outputs.sequence }}
+      url: ${{ steps.cut.outputs.url }}
+      activated: ${{ steps.cut.outputs.activated }}
+    steps:
+      - name: Cut release
+        id: cut
+        shell: bash
+        env:
+          API_URL: ${{ inputs.api_url }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          IMAGES: ${{ inputs.images }}
+          BRANCH: ${{ inputs.branch }}
+          COMMIT: ${{ inputs.commit }}
+          NOTES: ${{ inputs.notes }}
+          ACTIVATE: ${{ inputs.activate }}
+          DEPLOY_TOKEN: ${{ secrets.deploy_token }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_TOKEN" ]; then
+            echo "::error::secrets.deploy_token is empty — mint a deploy token for '$ENVIRONMENT' in the console and store it as a repo secret"
+            exit 1
+          fi
+          if [ -z "$IMAGES" ] && [ -z "$BRANCH" ]; then
+            echo "::error::pass either images (tags per slot) or branch"
+            exit 1
+          fi
+          if [ -n "$IMAGES" ] && [ -n "$BRANCH" ]; then
+            echo "::error::images and branch are mutually exclusive"
+            exit 1
+          fi
+          body="$(jq -nc \
+            --arg images "$IMAGES" --arg branch "$BRANCH" --arg commit "$COMMIT" \
+            --arg notes "$NOTES" --argjson activate "$ACTIVATE" '
+            {commit: $commit, notes: $notes, activate: $activate}
+            + (if $images != "" then {images: ($images | fromjson)} else {} end)
+            + (if $branch != "" then {branch: $branch} else {} end)')"
+          url="$API_URL/api/deploy/environments/$ENVIRONMENT/releases"
+          echo "POST $url"
+          http_code="$(curl -sS -o response.json -w '%{http_code}' \
+            -X POST "$url" \
+            -H "Authorization: Bearer $DEPLOY_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$body")"
+          if [ "$http_code" != "201" ]; then
+            reason="$(jq -r '.detail.reason // "http_'"$http_code"'"' response.json 2>/dev/null || echo "http_$http_code")"
+            message="$(jq -r '.detail.message // .detail // .' response.json 2>/dev/null || cat response.json)"
+            echo "::error title=Tol Galen release refused ($reason)::$message"
+            jq '.' response.json 2>/dev/null || cat response.json
+            exit 1
+          fi
+          sequence="$(jq -r '.sequence' response.json)"
+          release_url="$(jq -r '.url' response.json)"
+          activated="$(jq -r '.activated' response.json)"
+          active="$(jq -r '.active_sequence // "none"' response.json)"
+          echo "sequence=$sequence" >> "$GITHUB_OUTPUT"
+          echo "url=$release_url" >> "$GITHUB_OUTPUT"
+          echo "activated=$activated" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Tol Galen release → \`$ENVIRONMENT\`"
+            echo
+            echo "- release **$sequence** cut$( [ "$activated" = "true" ] && echo " and activated" || echo " (staged; active: $active)")"
+            echo "- URL: $release_url"
+            [ -n "$COMMIT" ] && echo "- commit: \`$COMMIT\`"
+            echo
+            jq -r '.notes[]? | "- note: \(.)"' response.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "release $sequence → $release_url (activated=$activated)"
