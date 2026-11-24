@@ -125,6 +125,42 @@ and, with `delete_stale_branches`, the branches — that would be reaped without
 touching anything. See the workflow's input descriptions for these and the
 legacy-tag knobs.
 
+### `tolgalen-release.yml`
+
+Cuts a **Tol Galen release** for one environment from the calling repo's own
+CI, after its image build, and optionally activates it. It authenticates with
+a **per-environment deploy token** (`adep_…`) minted in the autodev console on
+that environment's page, stored as a secret in the calling repo. The token is
+scoped to that one environment and to the acts granted at mint: a dev token
+usually carries `activate`; a prod token is cut-only unless an org admin
+granted `activate`, so prod CI stages the release and a person (console) or an
+agent (MCP, with confirm) activates it.
+
+```yaml
+  deploy-dev:
+    needs: build
+    uses: miriel-ai/autodev-workflows/.github/workflows/tolgalen-release.yml@v1
+    with:
+      environment: widget-dev
+      images: '{"frontend_tag": "${{ needs.build.outputs.web_tag }}", "backend_tag": "${{ needs.build.outputs.api_tag }}"}'
+      commit: ${{ github.sha }}
+      activate: true
+    secrets:
+      deploy_token: ${{ secrets.TOLGALEN_DEPLOY_TOKEN_DEV }}
+```
+
+Pass either `images` (a tag per slot, as the component declares its slots) or
+`branch` (the control plane resolves the branch's newest built tags, or, with
+`commit`, that commit's build). `api_url` names the plane the environment
+lives on and defaults to the prod plane, `https://autodev.miriel.ai`; the dev
+plane is `https://autodev.builds.miriel.ai`, and the workflow refuses any
+other value, so the token is never sent anywhere else or over plain HTTP. A
+token is valid on one plane only. The workflow calls only
+`$api_url/api/deploy/...` with the token as a bearer; it holds no credentials
+of its own and never prints the token. The full lane
+(minting tokens, scopes, the prod rule) is documented in miriel-infra's
+`docs/tolgalen-deploy-tokens.md` (miriel-internal).
+
 ## Versioning
 
 Pin to the moving major tag:
@@ -133,8 +169,8 @@ Pin to the moving major tag:
 uses: miriel-ai/autodev-workflows/.github/workflows/cleanup-ecr-tags.yml@v1
 ```
 
-`v1` tracks the latest `v1.x.y` release. Pin a specific `v1.x.y` tag instead if
-you need an immutable reference.
+`v1` tracks the latest `v1.x.y` release (`v1.2.0` added `tolgalen-release.yml`).
+Pin a specific `v1.x.y` tag instead if you need an immutable reference.
 
 ## What is *not* here
 
@@ -143,8 +179,8 @@ Deployment record used to be a reusable workflow a caller invoked, but the
 deploy-controller now renders that surface (every routed host — dashboard,
 `-api`, `-anor`) and posts it **server-side via its GitHub App, for every
 org**. There is nothing left for a calling repo to mirror, so the workflow has
-been retired. Only workflows that *must* run in the caller's own CI (e.g. the
-ECR tag cleanup above) live in this public repo.
+been retired. Only workflows that *must* run in the caller's own CI (the ECR
+tag cleanup and the Tol Galen release above) live in this public repo.
 
 ## Full model
 
