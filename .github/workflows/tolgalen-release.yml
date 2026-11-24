@@ -67,8 +67,10 @@ on:
           The autodev control plane the environment lives on (no trailing slash).
           Defaults to the prod plane, https://autodev.miriel.ai, where prod and
           customer environments live. An environment on the dev plane (Miriel's
-          own dev tier) needs https://autodev.builds.miriel.ai. A token is valid
-          on one plane only, so the wrong plane fails with 401.
+          own dev tier) needs https://autodev.builds.miriel.ai. Only those two
+          HTTPS origins are accepted: the deploy token is sent as a bearer and
+          goes nowhere else. A token is valid on one plane only, so the wrong
+          plane fails with 401.
         required: false
         type: string
         default: https://autodev.miriel.ai
@@ -115,6 +117,13 @@ jobs:
             echo "::error::secrets.deploy_token is empty — mint a deploy token for '$ENVIRONMENT' in the console and store it as a repo secret"
             exit 1
           fi
+          case "$API_URL" in
+            https://autodev.miriel.ai|https://autodev.builds.miriel.ai) ;;
+            *)
+              echo "::error::api_url must be a Miriel control plane: https://autodev.miriel.ai (prod) or https://autodev.builds.miriel.ai (dev). The deploy token is sent only to one of those."
+              exit 1
+              ;;
+          esac
           if [ -z "$IMAGES" ] && [ -z "$BRANCH" ]; then
             echo "::error::pass either images (tags per slot) or branch"
             exit 1

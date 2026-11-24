@@ -152,10 +152,12 @@ agent (MCP, with confirm) activates it.
 Pass either `images` (a tag per slot, as the component declares its slots) or
 `branch` (the control plane resolves the branch's newest built tags, or, with
 `commit`, that commit's build). `api_url` names the plane the environment
-lives on and defaults to the prod plane, `https://autodev.miriel.ai`; a token
-is valid on one plane only. The workflow calls only `$api_url/api/deploy/...`
-with the token as a bearer; it holds no credentials of its own and never
-prints the token. The full lane
+lives on and defaults to the prod plane, `https://autodev.miriel.ai`; the dev
+plane is `https://autodev.builds.miriel.ai`, and the workflow refuses any
+other value, so the token is never sent anywhere else or over plain HTTP. A
+token is valid on one plane only. The workflow calls only
+`$api_url/api/deploy/...` with the token as a bearer; it holds no credentials
+of its own and never prints the token. The full lane
 (minting tokens, scopes, the prod rule) is documented in miriel-infra's
 `docs/tolgalen-deploy-tokens.md` (miriel-internal).
 
